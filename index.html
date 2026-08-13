@@ -150,7 +150,7 @@
     /§[0-9a-fk-orA-FK-OR]/g,
     /<[a-zA-Z0-9_#:\/=,. \-]+>/g,
     /minecraft:[a-z0-9_.]+/g,
-    /\b[A-Z][A-Z0-9_]{2,}\b/g,
+    /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g,  // solo constantes con guion_bajo (DIAMOND_SWORD), no palabras sueltas en mayúscula
     /%%/g,
   ];
 
@@ -158,6 +158,20 @@
     var m = line.match(/^(\s*)(-\s+)?([^:#][^:]*?)(:)(\s*)(.*)$/);
     if (!m) return null;
     return { indent: m[1], dash: m[2] || "", key: m[3], colon: m[4], sp: m[5], rest: m[6] };
+  }
+
+  // Línea de item de lista SIN clave, ej:  "  - '&7Una espada muy poderosa'"  o  "  - Sin descripción"
+  // No debe confundirse con "  - key: value" (eso lo captura splitKeyValue con dash).
+  function splitListItem(line) {
+    var m = line.match(/^(\s*)-\s+(.*)$/);
+    if (!m) return null;
+    var rest = m[2];
+    // si el resto tiene forma "algo:" que parece ser un mapa dentro del item, no lo tratamos como texto plano
+    if (/^[^:#]+:\s*($|.)/.test(rest) && splitKeyValue(line) && splitKeyValue(line).key) {
+      // Es "- key: value" (splitKeyValue ya lo captura) -> dejar que lo maneje esa ruta
+      return null;
+    }
+    return { indent: m[1], rest: rest };
   }
 
   function extractInlineComment(value) {
@@ -192,10 +206,60 @@
 
   function parseLines(content) {
     var lines = content.split(/\r\n|\n/);
+    var lastKeyStack = []; // pila de {indent, key} para inferir la clave "activa" que aplica a items de lista sin clave propia
     return lines.map(function (raw, idx) {
       if (/^\s*#/.test(raw) || raw.trim() === "") return { idx: idx, raw: raw, type: "skip" };
+
       var kv = splitKeyValue(raw);
-      if (!kv) return { idx: idx, raw: raw, type: "skip" };
+
+      if (kv && kv.dash === "") {
+        // línea "clave: valor" normal (no es item de lista) -> actualizar la pila de contexto
+        var indentLen = kv.indent.length;
+        while (lastKeyStack.length && lastKeyStack[lastKeyStack.length - 1].indentLen >= indentLen) {
+          lastKeyStack.pop();
+        }
+        lastKeyStack.push({ indentLen: indentLen, key: kv.key.trim() });
+      }
+
+      if (!kv) {
+        // no es "clave: valor" -> puede ser un item de lista de texto plano ("- 'algo'")
+        var li = splitListItem(raw);
+        if (!li) return { idx: idx, raw: raw, type: "skip" };
+
+        var licTrim = li.rest.trim();
+        if (licTrim === "") return { idx: idx, raw: raw, type: "skip" };
+
+        var licIc = extractInlineComment(li.rest);
+        var licSq = stripQuotes(licIc.val);
+        var licText = licSq.text, licQuote = licSq.quote, licComment = licIc.comment;
+
+        var licNever =
+          licText === "" ||
+          /^(true|false|null|yes|no)$/i.test(licText) ||
+          /^-?\d+(\.\d+)?$/.test(licText) ||
+          /^\[.*\]$/.test(licText) ||
+          /^\{.*\}$/.test(licText) ||
+          /^[A-Z0-9_]{2,}$/.test(licText) ||
+          /^minecraft:[a-z0-9_.]+$/.test(licText) ||
+          /^#[0-9a-fA-F]{3,8}$/.test(licText) ||
+          /^[a-z0-9_]+(\.[a-z0-9_]+)+$/.test(licText);
+
+        var licHasLetters = /[a-zA-ZÀ-ÿ]/.test(licText);
+
+        // clave "activa" heredada (ej: lore, messages, commands...) para decidir si el contenedor es de texto
+        var activeKey = lastKeyStack.length ? lastKeyStack[lastKeyStack.length - 1].key : "";
+        var containerSuggestsText = TEXT_KEY_HINTS.test(activeKey) || activeKey === "" ;
+
+        if (licNever || !licHasLetters || !containerSuggestsText) {
+          return { idx: idx, raw: raw, type: "skip" };
+        }
+
+        return {
+          idx: idx, raw: raw, type: "translate-list",
+          indent: li.indent, quote: licQuote, text: licText, comment: licComment
+        };
+      }
+
       var indent = kv.indent, dash = kv.dash, key = kv.key, sp = kv.sp, rest = kv.rest;
 
       var restTrim = rest.trim();
@@ -256,12 +320,17 @@
     });
   }
 
+  // Prefijo/sufijo elegidos para que un motor de traducción los trate como una
+  // palabra normal (sin espacios, sin símbolos exóticos) y no los altere ni les
+  // agregue espacios internos. Ej: Zqkx7Zn0Zqkx7Zn1
+  var TOKEN_PREFIX = "Zqkx7Zn";
+
   function protectPlaceholders(text) {
     var map = [];
     var protectedText = text;
     PLACEHOLDER_PATTERNS.forEach(function (pattern) {
       protectedText = protectedText.replace(pattern, function (match) {
-        var token = "\u27E6P" + map.length + "\u27E7";
+        var token = TOKEN_PREFIX + map.length + "z";
         map.push(match);
         return token;
       });
@@ -272,13 +341,23 @@
   function restorePlaceholders(text, map) {
     var restored = text;
     map.forEach(function (original, i) {
-      var token = "\u27E6P" + i + "\u27E7";
-      restored = restored.split(token).join(original);
+      // Acepta variantes con espacio insertado por el traductor entre prefijo/número/sufijo,
+      // y es tolerante a mayúsculas/minúsculas que algunos motores normalizan.
+      var loose = new RegExp(TOKEN_PREFIX.replace(/[a-z]/gi, function (c) {
+        return "[" + c.toLowerCase() + c.toUpperCase() + "]";
+      }) + "\\s*" + i + "\\s*z", "gi");
+      restored = restored.replace(loose, original);
     });
     return restored;
   }
 
   function rebuildLine(rec, translatedText) {
+    if (rec.type === "translate-list") {
+      var lq = rec.quote;
+      var lvalue = lq ? (lq + translatedText + lq) : translatedText;
+      var lcommentPart = rec.comment ? (" " + rec.comment) : "";
+      return rec.indent + "- " + lvalue + lcommentPart;
+    }
     var q = rec.quote;
     var value = q ? (q + translatedText + q) : translatedText;
     var commentPart = rec.comment ? (" " + rec.comment) : "";
@@ -426,6 +505,10 @@
       var hit = glossaryLookup(glossary, targetLangCode, it.protectedText);
       if (hit !== null) {
         results[it.id] = { text: hit, source: "glossary" };
+        if (onOne) onOne();
+      } else if (it.hasRealText === false) {
+        // Solo códigos de color / placeholders, sin texto real que traducir.
+        results[it.id] = { text: it.protectedText, source: "skip" };
         if (onOne) onOne();
       } else {
         pending.push(it);
@@ -578,11 +661,15 @@
 
       try {
         var lineRecords = parseLines(content);
-        var translatable = lineRecords.filter(function (r) { return r.type === "translate"; });
+        var translatable = lineRecords.filter(function (r) { return r.type === "translate" || r.type === "translate-list"; });
 
         var items = translatable.map(function (rec, i) {
           var pp = protectPlaceholders(rec.text);
-          return { id: String(i), protectedText: pp.protectedText, map: pp.map, rec: rec };
+          // Si tras proteger placeholders/colores no queda ninguna letra real (ej: "&r", "&8&m----"),
+          // no tiene sentido enviarlo al traductor: se deja tal cual.
+          var strippedOfTokens = pp.protectedText.replace(new RegExp(TOKEN_PREFIX + "\\d+z", "gi"), "");
+          var hasRealText = /[a-zA-ZÀ-ÿ]/.test(strippedOfTokens);
+          return { id: String(i), protectedText: pp.protectedText, map: pp.map, rec: rec, hasRealText: hasRealText };
         });
 
         setProgress({ done: 0, total: items.length });
@@ -623,7 +710,7 @@
         chain.then(function () {
           var ptr = 0;
           var outLines = lineRecords.map(function (rec) {
-            if (rec.type === "skip") return rec.raw;
+            if (rec.type !== "translate" && rec.type !== "translate-list") return rec.raw;
             var id = String(ptr);
             ptr++;
             var translatedText = resultMap[id] !== undefined ? resultMap[id] : rec.text;
