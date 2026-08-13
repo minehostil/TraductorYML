@@ -142,6 +142,40 @@
     { code: "zh", label: "Chino" },
   ];
 
+  // ---- Small caps Unicode (texto estilizado tipo "ᴡᴇʟᴄᴏᴍᴇ") ----
+  // Común en YMLs de Minecraft para títulos/lore decorativos. Los traductores
+  // automáticos no reconocen estos caracteres como letras, así que hay que
+  // convertir a minúsculas normales antes de traducir y volver a convertir
+  // el resultado al mismo estilo.
+  var SMALLCAPS_TO_LATIN = {
+    "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e", "ꜰ": "f", "ɢ": "g", "ʜ": "h",
+    "ɪ": "i", "ᴊ": "j", "ᴋ": "k", "ʟ": "l", "ᴍ": "m", "ɴ": "n", "ᴏ": "o", "ᴘ": "p",
+    "ǫ": "q", "ʀ": "r", "ᴛ": "t", "ᴜ": "u", "ᴠ": "v", "ᴡ": "w", "ʏ": "y", "ᴢ": "z",
+  };
+  var LATIN_TO_SMALLCAPS = {};
+  Object.keys(SMALLCAPS_TO_LATIN).forEach(function (k) {
+    LATIN_TO_SMALLCAPS[SMALLCAPS_TO_LATIN[k]] = k;
+  });
+  var SMALLCAPS_CHAR_RE = new RegExp("[" + Object.keys(SMALLCAPS_TO_LATIN).join("") + "]", "g");
+
+  function containsSmallCaps(text) {
+    SMALLCAPS_CHAR_RE.lastIndex = 0;
+    return SMALLCAPS_CHAR_RE.test(text);
+  }
+
+  // Convierte small caps -> latinas normales, manteniendo mayúsculas donde ya había
+  // una letra latina normal en mayúscula junto al texto (heurística simple: si el
+  // texto no tenía NINGUNA mayúscula latina real, se asume todo en minúscula).
+  function smallCapsToLatin(text) {
+    return text.replace(SMALLCAPS_CHAR_RE, function (ch) { return SMALLCAPS_TO_LATIN[ch]; });
+  }
+
+  function latinToSmallCaps(text) {
+    return text.replace(/[a-z]/g, function (ch) {
+      return LATIN_TO_SMALLCAPS[ch] || ch;
+    });
+  }
+
   var PLACEHOLDER_PATTERNS = [
     /%[a-zA-Z0-9_\-]+%/g,
     /\{\{[a-zA-Z0-9_\-]+\}\}/g,
@@ -244,7 +278,7 @@
           /^#[0-9a-fA-F]{3,8}$/.test(licText) ||
           /^[a-z0-9_]+(\.[a-z0-9_]+)+$/.test(licText);
 
-        var licHasLetters = /[a-zA-ZÀ-ÿ]/.test(licText);
+        var licHasLetters = /[a-zA-ZÀ-ÿ]/.test(licText) || containsSmallCaps(licText);
 
         // clave "activa" heredada (ej: lore, messages, commands...) para decidir si el contenedor es de texto
         var activeKey = lastKeyStack.length ? lastKeyStack[lastKeyStack.length - 1].key : "";
@@ -288,7 +322,7 @@
       }
 
       var normalizedKey = key.trim();
-      var hasLetters = /[a-zA-ZÀ-ÿ]/.test(text);
+      var hasLetters = /[a-zA-ZÀ-ÿ]/.test(text) || containsSmallCaps(text);
 
       if (!hasLetters) {
         return { idx: idx, raw: raw, type: "skip" };
@@ -664,12 +698,14 @@
         var translatable = lineRecords.filter(function (r) { return r.type === "translate" || r.type === "translate-list"; });
 
         var items = translatable.map(function (rec, i) {
-          var pp = protectPlaceholders(rec.text);
+          var wasSmallCaps = containsSmallCaps(rec.text);
+          var normalizedText = wasSmallCaps ? smallCapsToLatin(rec.text) : rec.text;
+          var pp = protectPlaceholders(normalizedText);
           // Si tras proteger placeholders/colores no queda ninguna letra real (ej: "&r", "&8&m----"),
           // no tiene sentido enviarlo al traductor: se deja tal cual.
           var strippedOfTokens = pp.protectedText.replace(new RegExp(TOKEN_PREFIX + "\\d+z", "gi"), "");
           var hasRealText = /[a-zA-ZÀ-ÿ]/.test(strippedOfTokens);
-          return { id: String(i), protectedText: pp.protectedText, map: pp.map, rec: rec, hasRealText: hasRealText };
+          return { id: String(i), protectedText: pp.protectedText, map: pp.map, rec: rec, hasRealText: hasRealText, wasSmallCaps: wasSmallCaps };
         });
 
         setProgress({ done: 0, total: items.length });
@@ -695,7 +731,9 @@
               var res = translated[it.id];
               if (res) {
                 counters[res.source] = (counters[res.source] || 0) + 1;
-                resultMap[it.id] = restorePlaceholders(res.text, it.map);
+                var restored = restorePlaceholders(res.text, it.map);
+                if (it.wasSmallCaps) restored = latinToSmallCaps(restored);
+                resultMap[it.id] = restored;
                 // learn new auto-translations into the glossary for next time
                 if (res.source === "auto") {
                   glossarySet(newGlossary, targetLang, it.protectedText, res.text);
@@ -983,7 +1021,7 @@
           h("pre", { className: "out mono", style: { marginTop: 12 } }, outputContent)
         ),
 
-        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, etiquetas MiniMessage) no se traducen y se preservan exactamente igual. La traducción automática prueba varios servicios gratuitos en cascada; si todos fallan en tu red, aparecerá como \"sin traducir\".")
+        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, etiquetas MiniMessage) no se traducen y se preservan exactamente igual. El texto en small caps (ᴀʙᴄ) se traduce y se devuelve en el mismo estilo. La traducción automática prueba varios servicios gratuitos en cascada; si todos fallan en tu red, aparecerá como \"sin traducir\".")
       )
     );
   }
