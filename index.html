@@ -288,26 +288,41 @@
   var LIBRETRANSLATE_ENDPOINTS = [
     "https://libretranslate.com/translate",
     "https://translate.terraprint.co/translate",
+    "https://libretranslate.de/translate",
   ];
 
-  function libreTranslateOne(text, targetLangCode, endpointIndex) {
+  function fetchWithTimeout(url, options, ms) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, ms || 12000);
+    return fetch(url, Object.assign({}, options, { signal: controller.signal }))
+      .finally(function () { clearTimeout(timer); });
+  }
+
+  function libreTranslateOne(text, targetLangCode, endpointIndex, lastError) {
     endpointIndex = endpointIndex || 0;
     if (endpointIndex >= LIBRETRANSLATE_ENDPOINTS.length) {
-      return Promise.reject(new Error("Todos los servidores de traducción automática fallaron."));
+      return Promise.reject(lastError || new Error("Todos los servidores de traducción automática fallaron."));
     }
     var url = LIBRETRANSLATE_ENDPOINTS[endpointIndex];
-    return fetch(url, {
+    return fetchWithTimeout(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ q: text, source: "auto", target: targetLangCode, format: "text" }),
-    }).then(function (response) {
-      if (!response.ok) throw new Error("HTTP " + response.status);
+    }, 12000).then(function (response) {
+      if (!response.ok) {
+        return response.text().then(function (t) {
+          throw new Error(url + " → HTTP " + response.status + (t ? (": " + t.slice(0, 140)) : ""));
+        });
+      }
       return response.json();
     }).then(function (data) {
-      if (!data || typeof data.translatedText !== "string") throw new Error("Respuesta inválida");
+      if (!data || typeof data.translatedText !== "string") {
+        throw new Error(url + " → respuesta inesperada: " + JSON.stringify(data).slice(0, 140));
+      }
       return data.translatedText;
     }).catch(function (err) {
-      return libreTranslateOne(text, targetLangCode, endpointIndex + 1);
+      var msg = (err && err.name === "AbortError") ? new Error(url + " → tiempo de espera agotado") : err;
+      return libreTranslateOne(text, targetLangCode, endpointIndex + 1, msg);
     });
   }
 
@@ -318,10 +333,11 @@
   }
 
   // items: [{id, protectedText, map, rec}]
-  // returns Promise<{ [id]: { text, source } }>  source: "glossary" | "auto" | "error"
+  // returns Promise<{ [id]: { text, source, error? } }>  source: "glossary" | "auto" | "error"
   function translateBatch(items, targetLangCode, glossary, onOne) {
     var results = {};
     var pending = [];
+    var lastErrorMsg = null;
 
     items.forEach(function (it) {
       var hit = glossaryLookup(glossary, targetLangCode, it.protectedText);
@@ -340,13 +356,17 @@
           results[it.id] = { text: translated, source: "auto" };
           if (onOne) onOne();
         }).catch(function (err) {
+          lastErrorMsg = err && err.message ? err.message : String(err);
           results[it.id] = { text: it.protectedText, source: "error" };
           if (onOne) onOne();
         });
       });
     });
 
-    return chain.then(function () { return results; });
+    return chain.then(function () {
+      results.__lastError = lastErrorMsg;
+      return results;
+    });
   }
 
   // ---- Icons (inline SVG via createElement) ----
@@ -488,6 +508,7 @@
         var resultMap = {};
         var counters = { glossary: 0, auto: 0, error: 0 };
         var doneCount = 0;
+        var lastNetworkError = null;
 
         var newGlossary = JSON.parse(JSON.stringify(glossary));
 
@@ -499,6 +520,7 @@
               setProgress({ done: doneCount, total: items.length });
             });
           }).then(function (translated) {
+            if (translated.__lastError) lastNetworkError = translated.__lastError;
             batch.forEach(function (it) {
               var res = translated[it.id];
               if (res) {
@@ -528,7 +550,10 @@
           setStats(counters);
           setGlossary(newGlossary);
           saveGlossary(newGlossary);
-          setStatus("done");
+          if (counters.error > 0 && lastNetworkError) {
+            setErrorMsg((counters.auto === 0 ? "No se pudo conectar con el traductor automático. " : "Algunos textos no se pudieron traducir. ") + "Detalle: " + lastNetworkError);
+          }
+          setStatus(counters.error > 0 && counters.auto === 0 && counters.glossary === 0 ? "error" : "done");
         }).catch(function (err) {
           console.error(err);
           setErrorMsg("No se pudo completar la traducción: " + err.message);
@@ -762,7 +787,7 @@
           )
         ),
 
-        status === "error" && h("div", { className: "error-box" }, errorMsg),
+        (status === "error" || (status === "done" && errorMsg)) && h("div", { className: "error-box" }, errorMsg),
 
         outputContent && h("div", { className: "card" },
           h("div", { className: "row-between" },
