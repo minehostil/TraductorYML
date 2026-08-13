@@ -44,6 +44,18 @@
   .input { width: 100%; border-radius: 12px; background: #0B0D10; border: 1px solid #22262C; padding: 10px 14px; font-size: 13px; color: #D6D9DE; outline: none; }
   .input:focus { border-color: rgba(84,218,244,0.5); }
   .hint { font-size: 11px; color: #5A5F67; margin: 8px 0 0; line-height: 1.5; }
+  .btn-icon { display:flex; align-items:center; justify-content:center; width: 40px; border-radius: 10px; border: 1px solid #22262C; background: #0B0D10; color: #7EE3F7; flex-shrink: 0; }
+  .btn-icon:hover { border-color: #54DAF4; }
+  .btn-icon-sm { display:flex; align-items:center; justify-content:center; width: 24px; height: 24px; border-radius: 6px; border: none; background: transparent; color: #6B7078; flex-shrink: 0; }
+  .btn-icon-sm:hover { color: #FF8A8A; }
+  .glossary-list { max-height: 200px; overflow-y: auto; border-radius: 10px; border: 1px solid #1C1F24; }
+  .glossary-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; font-size: 12.5px; border-bottom: 1px solid #1C1F24; }
+  .glossary-row:last-child { border-bottom: none; }
+  .glossary-src { color: #9296A0; flex: 1 1 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .glossary-arrow { color: #4A4F57; flex-shrink: 0; }
+  .glossary-dst { color: #D6D9DE; flex: 1 1 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stats-row { display:flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 0; font-size: 12px; color: #9296A0; }
+  .stats-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:5px; }
 
   .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
   .tab { flex: 1; display:flex; align-items:center; justify-content:center; gap:8px; border-radius: 12px; border: 1px solid #22262C; background: #111318; color: #9296A0; padding: 12px 16px; font-size: 14px; font-weight: 500; transition: border-color .15s, background .15s, color .15s; }
@@ -235,68 +247,106 @@
     return rec.indent + rec.dash + rec.key + ":" + (rec.sp || " ") + value + commentPart;
   }
 
-  function callClaude(apiKey, systemPrompt, userPrompt) {
-    return fetch("https://api.anthropic.com/v1/messages", {
+  // ---- Glosario local (localStorage) ----
+  var GLOSSARY_KEY = "yml_translator_glossary_v1";
+
+  function normalizeKey(s) {
+    return s.trim().toLowerCase().replace(/\s+/g, " ");
+  }
+
+  function loadGlossary() {
+    try {
+      var raw = localStorage.getItem(GLOSSARY_KEY);
+      if (!raw) return {};
+      return JSON.parse(raw);
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveGlossary(glossary) {
+    try {
+      localStorage.setItem(GLOSSARY_KEY, JSON.stringify(glossary));
+    } catch (e) {}
+  }
+
+  // glossary shape: { "<targetLangCode>": { "normalized protected text": "translated text" } }
+  function glossaryLookup(glossary, langCode, protectedText) {
+    var bucket = glossary[langCode];
+    if (!bucket) return null;
+    var norm = normalizeKey(protectedText);
+    if (bucket[norm] !== undefined) return bucket[norm];
+    return null;
+  }
+
+  function glossarySet(glossary, langCode, protectedText, translated) {
+    if (!glossary[langCode]) glossary[langCode] = {};
+    glossary[langCode][normalizeKey(protectedText)] = translated;
+  }
+
+  // ---- Motor de traducción automática gratuito (sin API key) ----
+  var LIBRETRANSLATE_ENDPOINTS = [
+    "https://libretranslate.com/translate",
+    "https://translate.terraprint.co/translate",
+  ];
+
+  function libreTranslateOne(text, targetLangCode, endpointIndex) {
+    endpointIndex = endpointIndex || 0;
+    if (endpointIndex >= LIBRETRANSLATE_ENDPOINTS.length) {
+      return Promise.reject(new Error("Todos los servidores de traducción automática fallaron."));
+    }
+    var url = LIBRETRANSLATE_ENDPOINTS[endpointIndex];
+    return fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userPrompt }],
-      }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ q: text, source: "auto", target: targetLangCode, format: "text" }),
     }).then(function (response) {
-      if (!response.ok) {
-        return response.text().then(function (t) {
-          throw new Error("API error " + response.status + ": " + t);
-        });
-      }
+      if (!response.ok) throw new Error("HTTP " + response.status);
       return response.json();
     }).then(function (data) {
-      var block = data.content.find(function (b) { return b.type === "text"; });
-      return block ? block.text : "";
+      if (!data || typeof data.translatedText !== "string") throw new Error("Respuesta inválida");
+      return data.translatedText;
+    }).catch(function (err) {
+      return libreTranslateOne(text, targetLangCode, endpointIndex + 1);
     });
   }
 
-  var BATCH_SIZE = 40;
   function chunk(arr, size) {
     var out = [];
     for (var i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
     return out;
   }
 
-  function translateBatch(apiKey, items, targetLangLabel) {
-    var payload = items.map(function (it) { return { id: it.id, text: it.protectedText }; });
-    var system = "Eres un traductor técnico especializado en archivos de configuración YAML para plugins de servidores de Minecraft (Paper/Spigot). Traduces ÚNICAMENTE el texto visible para el jugador (mensajes, lore, nombres, descripciones).\n\n" +
-      "REGLAS ESTRICTAS:\n" +
-      "1. Traduce SIEMPRE al idioma solicitado: " + targetLangLabel + ".\n" +
-      "2. NUNCA traduzcas ni modifiques tokens con la forma \u27E6P0\u27E7, \u27E6P1\u27E7, \u27E6P2\u27E7, etc. Cópialos EXACTAMENTE tal cual, en la misma posición relativa que tendrían en una traducción natural.\n" +
-      "3. No agregues comillas, dos puntos, ni cambies puntuación estructural.\n" +
-      "4. Conserva emojis y saltos de línea \"\\n\" literales si existen en el texto.\n" +
-      "5. Mantén el tono y formato (mayúsculas iniciales, signos de exclamación, etc.) equivalente al original.\n" +
-      "6. Responde ÚNICAMENTE con un JSON array válido, sin texto adicional, sin markdown, con este formato exacto:\n" +
-      "[{\"id\": \"0\", \"text\": \"traducción\"}, {\"id\": \"1\", \"text\": \"traducción\"}]\n" +
-      "El array debe tener exactamente los mismos \"id\" que la entrada, en cualquier orden.";
-    var user = "Traduce estos textos al " + targetLangLabel + ":\n" + JSON.stringify(payload, null, 2);
+  // items: [{id, protectedText, map, rec}]
+  // returns Promise<{ [id]: { text, source } }>  source: "glossary" | "auto" | "error"
+  function translateBatch(items, targetLangCode, glossary, onOne) {
+    var results = {};
+    var pending = [];
 
-    return callClaude(apiKey, system, user).then(function (raw) {
-      var clean = raw.replace(/```json|```/g, "").trim();
-      var parsed;
-      try {
-        parsed = JSON.parse(clean);
-      } catch (e) {
-        var match = clean.match(/\[[\s\S]*\]/);
-        parsed = match ? JSON.parse(match[0]) : [];
+    items.forEach(function (it) {
+      var hit = glossaryLookup(glossary, targetLangCode, it.protectedText);
+      if (hit !== null) {
+        results[it.id] = { text: hit, source: "glossary" };
+        if (onOne) onOne();
+      } else {
+        pending.push(it);
       }
-      var map = {};
-      parsed.forEach(function (p) { map[String(p.id)] = p.text; });
-      return map;
     });
+
+    var chain = Promise.resolve();
+    pending.forEach(function (it) {
+      chain = chain.then(function () {
+        return libreTranslateOne(it.protectedText, targetLangCode).then(function (translated) {
+          results[it.id] = { text: translated, source: "auto" };
+          if (onOne) onOne();
+        }).catch(function (err) {
+          results[it.id] = { text: it.protectedText, source: "error" };
+          if (onOne) onOne();
+        });
+      });
+    });
+
+    return chain.then(function () { return results; });
   }
 
   // ---- Icons (inline SVG via createElement) ----
@@ -351,6 +401,26 @@
     h("path", { key: 2, d: "M21 2l-9.6 9.6" }),
     h("path", { key: 3, d: "M15.5 7.5l3 3L22 7l-3-3" }),
   ]);
+  var IconBook = svgIcon([
+    h("path", { key: 1, d: "M4 19.5A2.5 2.5 0 0 1 6.5 17H20" }),
+    h("path", { key: 2, d: "M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" }),
+  ]);
+  var IconGlobe = svgIcon([
+    h("circle", { key: 1, cx: "12", cy: "12", r: "10" }),
+    h("line", { key: 2, x1: "2", y1: "12", x2: "22", y2: "12" }),
+    h("path", { key: 3, d: "M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" }),
+  ]);
+  var IconPlus = svgIcon([
+    h("line", { key: 1, x1: "12", y1: "5", x2: "12", y2: "19" }),
+    h("line", { key: 2, x1: "5", y1: "12", x2: "19", y2: "12" }),
+  ]);
+  var IconTrash = svgIcon([
+    h("polyline", { key: 1, points: "3 6 5 6 21 6" }),
+    h("path", { key: 2, d: "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" }),
+    h("path", { key: 3, d: "M10 11v6" }),
+    h("path", { key: 4, d: "M14 11v6" }),
+    h("path", { key: 5, d: "M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" }),
+  ]);
 
   function App() {
     var _mode = useState("upload"); var mode = _mode[0], setMode = _mode[1];
@@ -365,7 +435,11 @@
     var _copied = useState(false); var copied = _copied[0], setCopied = _copied[1];
     var _errorMsg = useState(""); var errorMsg = _errorMsg[0], setErrorMsg = _errorMsg[1];
     var _dragOver = useState(false); var dragOver = _dragOver[0], setDragOver = _dragOver[1];
-    var _apiKey = useState(""); var apiKey = _apiKey[0], setApiKey = _apiKey[1];
+    var _glossary = useState(function () { return loadGlossary(); }); var glossary = _glossary[0], setGlossary = _glossary[1];
+    var _glossOpen = useState(false); var glossOpen = _glossOpen[0], setGlossOpen = _glossOpen[1];
+    var _glossSource = useState(""); var glossSource = _glossSource[0], setGlossSource = _glossSource[1];
+    var _glossTarget = useState(""); var glossTarget = _glossTarget[0], setGlossTarget = _glossTarget[1];
+    var _stats = useState(null); var stats = _stats[0], setStats = _stats[1]; // {glossary: n, auto: n, error: n}
     var fileInputRef = useRef(null);
 
     var activeContent = mode === "upload" ? rawContent : pastedText;
@@ -393,15 +467,11 @@
     function runTranslation() {
       var content = activeContent;
       if (!content || !content.trim()) return;
-      if (!apiKey.trim()) {
-        setErrorMsg("Ingresa tu API key de Anthropic para traducir.");
-        setStatus("error");
-        return;
-      }
 
       setStatus("translating");
       setErrorMsg("");
       setOutputContent("");
+      setStats(null);
 
       try {
         var lineRecords = parseLines(content);
@@ -414,21 +484,34 @@
 
         setProgress({ done: 0, total: items.length });
 
-        var batches = chunk(items, BATCH_SIZE);
+        var batches = chunk(items, 20);
         var resultMap = {};
+        var counters = { glossary: 0, auto: 0, error: 0 };
         var doneCount = 0;
+
+        var newGlossary = JSON.parse(JSON.stringify(glossary));
 
         var chain = Promise.resolve();
         batches.forEach(function (batch) {
           chain = chain.then(function () {
-            return translateBatch(apiKey, batch, langLabel);
+            return translateBatch(batch, targetLang, newGlossary, function () {
+              doneCount++;
+              setProgress({ done: doneCount, total: items.length });
+            });
           }).then(function (translated) {
             batch.forEach(function (it) {
-              var t = translated[it.id];
-              resultMap[it.id] = t !== undefined ? restorePlaceholders(t, it.map) : it.rec.text;
+              var res = translated[it.id];
+              if (res) {
+                counters[res.source] = (counters[res.source] || 0) + 1;
+                resultMap[it.id] = restorePlaceholders(res.text, it.map);
+                // learn new auto-translations into the glossary for next time
+                if (res.source === "auto") {
+                  glossarySet(newGlossary, targetLang, it.protectedText, res.text);
+                }
+              } else {
+                resultMap[it.id] = it.rec.text;
+              }
             });
-            doneCount += batch.length;
-            setProgress({ done: doneCount, total: items.length });
           });
         });
 
@@ -442,6 +525,9 @@
             return rebuildLine(rec, translatedText);
           });
           setOutputContent(outLines.join("\n"));
+          setStats(counters);
+          setGlossary(newGlossary);
+          saveGlossary(newGlossary);
           setStatus("done");
         }).catch(function (err) {
           console.error(err);
@@ -454,6 +540,27 @@
         setStatus("error");
       }
     }
+
+    function addGlossaryTerm() {
+      if (!glossSource.trim() || !glossTarget.trim()) return;
+      var updated = JSON.parse(JSON.stringify(glossary));
+      glossarySet(updated, targetLang, glossSource, glossTarget.trim());
+      setGlossary(updated);
+      saveGlossary(updated);
+      setGlossSource("");
+      setGlossTarget("");
+    }
+
+    function removeGlossaryTerm(key) {
+      var updated = JSON.parse(JSON.stringify(glossary));
+      if (updated[targetLang]) delete updated[targetLang][key];
+      setGlossary(updated);
+      saveGlossary(updated);
+    }
+
+    var glossaryEntries = (glossary[targetLang] ? Object.keys(glossary[targetLang]) : []).map(function (k) {
+      return { key: k, translated: glossary[targetLang][k] };
+    });
 
     function handleCopy() {
       if (!outputContent) return;
@@ -496,18 +603,56 @@
         ),
 
         h("div", { className: "card" },
-          h("div", { className: "apikey-label" },
-            h(IconKey, { width: 15, height: 15, style: { color: "#6B7078" } }),
-            h("span", null, "API Key de Anthropic")
+          h("div", {
+            className: "apikey-label",
+            style: { cursor: "pointer", justifyContent: "space-between", display: "flex", alignItems: "center" },
+            onClick: function () { setGlossOpen(!glossOpen); }
+          },
+            h("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+              h(IconBook, { width: 15, height: 15, style: { color: "#6B7078" } }),
+              h("span", null, "Glosario (" + langLabel + ") · " + glossaryEntries.length + " términos")
+            ),
+            h(IconChevron, { width: 16, height: 16, style: { color: "#6B7078", transform: glossOpen ? "rotate(180deg)" : "none", transition: "transform .15s" } })
           ),
-          h("input", {
-            type: "password",
-            className: "input mono",
-            placeholder: "sk-ant-...",
-            value: apiKey,
-            onChange: function (e) { setApiKey(e.target.value); }
-          }),
-          h("p", { className: "hint" }, "Este archivo funciona de forma independiente y llama directamente a la API de Anthropic desde tu navegador, por eso necesita tu propia key (console.anthropic.com). No se guarda ni se envía a ningún servidor propio.")
+          h("p", { className: "hint", style: { marginTop: 4 } }, "Se revisa primero. Si un texto coincide, se usa tu traducción; si no, se traduce automáticamente y se guarda aquí para la próxima vez."),
+
+          glossOpen ? h("div", { style: { marginTop: 14 } },
+            h("div", { style: { display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" } },
+              h("input", {
+                className: "input",
+                style: { flex: "1 1 160px" },
+                placeholder: "Texto original",
+                value: glossSource,
+                onChange: function (e) { setGlossSource(e.target.value); }
+              }),
+              h("input", {
+                className: "input",
+                style: { flex: "1 1 160px" },
+                placeholder: "Traducción",
+                value: glossTarget,
+                onChange: function (e) { setGlossTarget(e.target.value); }
+              }),
+              h("button", {
+                className: "btn-icon",
+                onClick: addGlossaryTerm,
+                title: "Agregar término"
+              }, h(IconPlus, { width: 16, height: 16 }))
+            ),
+            glossaryEntries.length > 0 ? h("div", { className: "glossary-list" },
+              glossaryEntries.map(function (entry) {
+                return h("div", { key: entry.key, className: "glossary-row" },
+                  h("span", { className: "glossary-src" }, entry.key),
+                  h("span", { className: "glossary-arrow" }, "→"),
+                  h("span", { className: "glossary-dst" }, entry.translated),
+                  h("button", {
+                    className: "btn-icon-sm",
+                    onClick: function () { removeGlossaryTerm(entry.key); },
+                    title: "Eliminar"
+                  }, h(IconTrash, { width: 13, height: 13 }))
+                );
+              })
+            ) : h("p", { className: "hint" }, "Aún no hay términos guardados para este idioma.")
+          ) : null
         ),
 
         h("div", { className: "tabs" },
@@ -635,10 +780,15 @@
               )
             )
           ),
-          h("pre", { className: "out mono" }, outputContent)
+          stats && h("div", { className: "stats-row" },
+            h("span", null, h("span", { className: "stats-dot", style: { background: "#54DAF4" } }), (stats.glossary || 0) + " del glosario"),
+            h("span", null, h("span", { className: "stats-dot", style: { background: "#7EE3F7" } }), (stats.auto || 0) + " traducción automática"),
+            (stats.error || 0) > 0 ? h("span", null, h("span", { className: "stats-dot", style: { background: "#F45B5B" } }), stats.error + " sin traducir (error de red)") : null
+          ),
+          h("pre", { className: "out mono", style: { marginTop: 12 } }, outputContent)
         ),
 
-        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, etiquetas MiniMessage) no se traducen y se preservan exactamente igual.")
+        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, etiquetas MiniMessage) no se traducen y se preservan exactamente igual. La traducción automática usa un servicio público gratuito (LibreTranslate); si tu red lo bloquea, aparecerá como \"sin traducir\".")
       )
     );
   }
