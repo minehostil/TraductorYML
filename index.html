@@ -184,6 +184,12 @@
     return { quote: "", text: trimmed };
   }
 
+  // Claves que casi siempre contienen texto para el jugador (aunque el valor sea una sola palabra)
+  var TEXT_KEY_HINTS = /(message|msg|text|lore|name|title|desc|description|prefix|suffix|reason|tooltip|hover|label|tip|hint|error|success|warning|info|notice|announce|broadcast|greeting|farewell|welcome|goodbye|question|prompt|subtitle|actionbar|action-bar|bossbar|boss-bar)/i;
+
+  // Claves que casi siempre son técnicas, aunque el valor "parezca" texto
+  var TECHNICAL_KEY_HINTS = /^(material|item|type|sound|particle|effect|permission|perm|command|cmd|world|region|id|uuid|path|file|color|colour|action|mode|format|encoding|url|link|icon|texture|model|namespace)$/i;
+
   function parseLines(content) {
     var lines = content.split(/\r\n|\n/);
     return lines.map(function (raw, idx) {
@@ -201,18 +207,50 @@
       var sq = stripQuotes(ic.val);
       var text = sq.text, quote = sq.quote, comment = ic.comment;
 
-      var skipValue =
+      // Nunca traducibles bajo ninguna circunstancia: vacío, booleano, número, lista/mapa inline, constante MAYÚSCULA, id namespaced
+      var neverTranslatable =
         text === "" ||
         /^(true|false|null|yes|no)$/i.test(text) ||
         /^-?\d+(\.\d+)?$/.test(text) ||
         /^\[.*\]$/.test(text) ||
         /^\{.*\}$/.test(text) ||
-        /^[A-Z0-9_]+$/.test(text) ||
-        /^minecraft:[a-z0-9_.]+$/.test(text);
+        /^[A-Z0-9_]{2,}$/.test(text) ||          // MATERIAL_NAME / CONSTANT (2+ chars, evita falsos positivos de una letra)
+        /^minecraft:[a-z0-9_.]+$/.test(text) ||
+        /^#[0-9a-fA-F]{3,8}$/.test(text) ||       // color hex suelto
+        /^[a-z0-9_]+(\.[a-z0-9_]+)+$/.test(text); // rutas tipo plugin.permission.node o config.path.key
 
-      var looksTranslatable = /[a-zA-ZÀ-ÿ]/.test(text) && !/^[a-z0-9_\-./]+$/.test(text);
+      if (neverTranslatable) {
+        return { idx: idx, raw: raw, type: "skip" };
+      }
 
-      if (skipValue || !looksTranslatable) return { idx: idx, raw: raw, type: "skip" };
+      var normalizedKey = key.trim();
+      var hasLetters = /[a-zA-ZÀ-ÿ]/.test(text);
+
+      if (!hasLetters) {
+        return { idx: idx, raw: raw, type: "skip" };
+      }
+
+      var keySuggestsText = TEXT_KEY_HINTS.test(normalizedKey);
+      var keySuggestsTechnical = TECHNICAL_KEY_HINTS.test(normalizedKey);
+
+      // Si la clave técnica indica un valor de sistema (material, sonido, permiso...) y el valor
+      // es una sola palabra tipo identificador (sin espacios), no se traduce.
+      var looksLikeBareIdentifier = /^[a-zA-Z0-9_\-./]+$/.test(text) && !/\s/.test(text);
+
+      var shouldTranslate;
+      if (keySuggestsText) {
+        shouldTranslate = true; // confiar en la clave: mensajes, nombres, lore, etc.
+      } else if (keySuggestsTechnical && looksLikeBareIdentifier) {
+        shouldTranslate = false; // material/permiso/comando de una palabra: no traducir
+      } else {
+        // Clave ambigua: traducir salvo que sea un identificador de una sola palabra en minúsculas
+        // muy corto sin ninguna señal de idioma natural (evita falsos positivos de rutas/slugs).
+        shouldTranslate = !looksLikeBareIdentifier || text.length >= 3;
+      }
+
+      if (!shouldTranslate) {
+        return { idx: idx, raw: raw, type: "skip" };
+      }
 
       return { idx: idx, raw: raw, type: "translate", indent: indent, dash: dash, key: key, sp: sp, quote: quote, text: text, comment: comment };
     });
