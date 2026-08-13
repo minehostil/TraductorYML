@@ -285,44 +285,89 @@
   }
 
   // ---- Motor de traducción automática gratuito (sin API key) ----
+  // Varios proveedores en cascada: si uno falla (CORS, caído, rate-limit) prueba el siguiente.
+  function fetchWithTimeout(url, options, ms) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, ms || 10000);
+    return fetch(url, Object.assign({}, options, { signal: controller.signal }))
+      .finally(function () { clearTimeout(timer); });
+  }
+
+  // Provider 1: Google Translate (endpoint público no oficial, sin key, CORS abierto)
+  function providerGoogle(text, targetLangCode) {
+    var url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" +
+      encodeURIComponent(targetLangCode) + "&dt=t&q=" + encodeURIComponent(text);
+    return fetchWithTimeout(url, { method: "GET" }, 10000).then(function (response) {
+      if (!response.ok) throw new Error("Google Translate → HTTP " + response.status);
+      return response.json();
+    }).then(function (data) {
+      // data[0] is an array of [translatedChunk, originalChunk, ...] segments
+      if (!data || !Array.isArray(data[0])) throw new Error("Google Translate → respuesta inesperada");
+      var out = data[0].map(function (seg) { return seg[0]; }).join("");
+      if (!out) throw new Error("Google Translate → traducción vacía");
+      return out;
+    });
+  }
+
+  // Provider 2: MyMemory (servicio público gratuito, sin key, CORS abierto)
+  function providerMyMemory(text, targetLangCode) {
+    var url = "https://api.mymemory.translated.net/get?q=" + encodeURIComponent(text) +
+      "&langpair=" + encodeURIComponent("auto|" + targetLangCode);
+    return fetchWithTimeout(url, { method: "GET" }, 10000).then(function (response) {
+      if (!response.ok) throw new Error("MyMemory → HTTP " + response.status);
+      return response.json();
+    }).then(function (data) {
+      var out = data && data.responseData && data.responseData.translatedText;
+      if (!out) throw new Error("MyMemory → respuesta inesperada");
+      return out;
+    });
+  }
+
+  // Provider 3: LibreTranslate (varias instancias públicas)
   var LIBRETRANSLATE_ENDPOINTS = [
     "https://libretranslate.com/translate",
     "https://translate.terraprint.co/translate",
     "https://libretranslate.de/translate",
   ];
-
-  function fetchWithTimeout(url, options, ms) {
-    var controller = new AbortController();
-    var timer = setTimeout(function () { controller.abort(); }, ms || 12000);
-    return fetch(url, Object.assign({}, options, { signal: controller.signal }))
-      .finally(function () { clearTimeout(timer); });
-  }
-
-  function libreTranslateOne(text, targetLangCode, endpointIndex, lastError) {
+  function providerLibreTranslate(text, targetLangCode, endpointIndex, lastError) {
     endpointIndex = endpointIndex || 0;
     if (endpointIndex >= LIBRETRANSLATE_ENDPOINTS.length) {
-      return Promise.reject(lastError || new Error("Todos los servidores de traducción automática fallaron."));
+      return Promise.reject(lastError || new Error("LibreTranslate → todas las instancias fallaron."));
     }
     var url = LIBRETRANSLATE_ENDPOINTS[endpointIndex];
     return fetchWithTimeout(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ q: text, source: "auto", target: targetLangCode, format: "text" }),
-    }, 12000).then(function (response) {
-      if (!response.ok) {
-        return response.text().then(function (t) {
-          throw new Error(url + " → HTTP " + response.status + (t ? (": " + t.slice(0, 140)) : ""));
-        });
-      }
+    }, 10000).then(function (response) {
+      if (!response.ok) throw new Error(url + " → HTTP " + response.status);
       return response.json();
     }).then(function (data) {
-      if (!data || typeof data.translatedText !== "string") {
-        throw new Error(url + " → respuesta inesperada: " + JSON.stringify(data).slice(0, 140));
-      }
+      if (!data || typeof data.translatedText !== "string") throw new Error(url + " → respuesta inesperada");
       return data.translatedText;
     }).catch(function (err) {
       var msg = (err && err.name === "AbortError") ? new Error(url + " → tiempo de espera agotado") : err;
-      return libreTranslateOne(text, targetLangCode, endpointIndex + 1, msg);
+      return providerLibreTranslate(text, targetLangCode, endpointIndex + 1, msg);
+    });
+  }
+
+  var PROVIDERS = [
+    { name: "Google Translate", fn: providerGoogle },
+    { name: "MyMemory", fn: providerMyMemory },
+    { name: "LibreTranslate", fn: providerLibreTranslate },
+  ];
+
+  function autoTranslateOne(text, targetLangCode, providerIndex, lastError) {
+    providerIndex = providerIndex || 0;
+    if (providerIndex >= PROVIDERS.length) {
+      return Promise.reject(lastError || new Error("Todos los proveedores de traducción fallaron."));
+    }
+    var provider = PROVIDERS[providerIndex];
+    return provider.fn(text, targetLangCode).catch(function (err) {
+      var msg = (err && err.name === "AbortError")
+        ? new Error(provider.name + " → tiempo de espera agotado")
+        : (err instanceof Error ? err : new Error(provider.name + " → " + String(err)));
+      return autoTranslateOne(text, targetLangCode, providerIndex + 1, msg);
     });
   }
 
@@ -352,7 +397,7 @@
     var chain = Promise.resolve();
     pending.forEach(function (it) {
       chain = chain.then(function () {
-        return libreTranslateOne(it.protectedText, targetLangCode).then(function (translated) {
+        return autoTranslateOne(it.protectedText, targetLangCode).then(function (translated) {
           results[it.id] = { text: translated, source: "auto" };
           if (onOne) onOne();
         }).catch(function (err) {
@@ -813,7 +858,7 @@
           h("pre", { className: "out mono", style: { marginTop: 12 } }, outputContent)
         ),
 
-        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, etiquetas MiniMessage) no se traducen y se preservan exactamente igual. La traducción automática usa un servicio público gratuito (LibreTranslate); si tu red lo bloquea, aparecerá como \"sin traducir\".")
+        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, etiquetas MiniMessage) no se traducen y se preservan exactamente igual. La traducción automática prueba varios servicios gratuitos en cascada; si todos fallan en tu red, aparecerá como \"sin traducir\".")
       )
     );
   }
