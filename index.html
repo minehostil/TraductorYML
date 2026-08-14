@@ -142,6 +142,16 @@
     { code: "zh", label: "Chino" },
   ];
 
+  // Prefijo/sufijo elegidos para que un motor de traducción los trate como una
+  // palabra normal (sin espacios, sin símbolos exóticos) y no los altere ni les
+  // agregue espacios internos. Ej: Zqkx7Zn0z
+  var TOKEN_PREFIX = "Zqkx7Zn";
+  function tokenLooseRegexSource() {
+    return TOKEN_PREFIX.replace(/[a-z]/gi, function (c) {
+      return "[" + c.toLowerCase() + c.toUpperCase() + "]";
+    }) + "\\d+z";
+  }
+
   // ---- Small caps Unicode (texto estilizado tipo "ᴡᴇʟᴄᴏᴍᴇ") ----
   // Común en YMLs de Minecraft para títulos/lore decorativos. Los traductores
   // automáticos no reconocen estos caracteres como letras, así que hay que
@@ -163,24 +173,36 @@
     return SMALLCAPS_CHAR_RE.test(text);
   }
 
-  // Convierte small caps -> latinas normales, manteniendo mayúsculas donde ya había
-  // una letra latina normal en mayúscula junto al texto (heurística simple: si el
-  // texto no tenía NINGUNA mayúscula latina real, se asume todo en minúscula).
+  // Convierte small caps -> latinas normales.
   function smallCapsToLatin(text) {
     return text.replace(SMALLCAPS_CHAR_RE, function (ch) { return SMALLCAPS_TO_LATIN[ch]; });
   }
 
+  // Convierte latinas -> small caps, SALTANDO los tokens de placeholder (Zqkx7Zn0z...)
+  // para no corromper sus letras (que de otro modo también matchearían [a-z]).
   function latinToSmallCaps(text) {
-    return text.replace(/[a-z]/g, function (ch) {
-      return LATIN_TO_SMALLCAPS[ch] || ch;
-    });
+    var tokenRe = new RegExp(tokenLooseRegexSource(), "gi");
+    var result = "";
+    var lastIndex = 0;
+    var m;
+    while ((m = tokenRe.exec(text)) !== null) {
+      result += text.slice(lastIndex, m.index).replace(/[a-z]/g, function (ch) { return LATIN_TO_SMALLCAPS[ch] || ch; });
+      result += m[0]; // token intacto
+      lastIndex = m.index + m[0].length;
+    }
+    result += text.slice(lastIndex).replace(/[a-z]/g, function (ch) { return LATIN_TO_SMALLCAPS[ch] || ch; });
+    return result;
   }
 
   var PLACEHOLDER_PATTERNS = [
+    // Colores hex extendidos, con o sin '&' y con o sin formato encadenado (&l, &n, etc.)
+    // Deben ir ANTES que el patrón de un solo carácter &X, y del más específico al más genérico:
+    /&#[0-9a-fA-F]{6}(?:&[0-9a-fk-orA-FK-OR])*/g,  // &#RRGGBB seguido opcionalmente de &l, &n...
+    /#[0-9a-fA-F]{6}(?:&[0-9a-fk-orA-FK-OR])*/g,   // #RRGGBB (sin '&') seguido opcionalmente de &l, &n...
     /%[a-zA-Z0-9_\-]+%/g,
     /\{\{[a-zA-Z0-9_\-]+\}\}/g,
     /\{[a-zA-Z0-9_\-]+\}/g,
-    /&[0-9a-fk-orA-FK-OR]/g,
+    /&[0-9a-fk-orA-FK-OR]/g,                       // código legacy de 1 carácter: &a, &l, &r...
     /§[0-9a-fk-orA-FK-OR]/g,
     /<[a-zA-Z0-9_#:\/=,. \-]+>/g,
     /minecraft:[a-z0-9_.]+/g,
@@ -353,11 +375,6 @@
       return { idx: idx, raw: raw, type: "translate", indent: indent, dash: dash, key: key, sp: sp, quote: quote, text: text, comment: comment };
     });
   }
-
-  // Prefijo/sufijo elegidos para que un motor de traducción los trate como una
-  // palabra normal (sin espacios, sin símbolos exóticos) y no los altere ni les
-  // agregue espacios internos. Ej: Zqkx7Zn0Zqkx7Zn1
-  var TOKEN_PREFIX = "Zqkx7Zn";
 
   function protectPlaceholders(text) {
     var map = [];
@@ -699,13 +716,16 @@
 
         var items = translatable.map(function (rec, i) {
           var wasSmallCaps = containsSmallCaps(rec.text);
-          var normalizedText = wasSmallCaps ? smallCapsToLatin(rec.text) : rec.text;
-          var pp = protectPlaceholders(normalizedText);
+          // Orden correcto: primero proteger placeholders/colores (así "&b" se vuelve un
+          // token seguro y queda fuera de cualquier conversión), y solo DESPUÉS convertir
+          // small caps -> latín sobre lo que queda (el texto visible, sin códigos).
+          var pp = protectPlaceholders(rec.text);
+          var normalizedProtected = wasSmallCaps ? smallCapsToLatin(pp.protectedText) : pp.protectedText;
           // Si tras proteger placeholders/colores no queda ninguna letra real (ej: "&r", "&8&m----"),
           // no tiene sentido enviarlo al traductor: se deja tal cual.
-          var strippedOfTokens = pp.protectedText.replace(new RegExp(TOKEN_PREFIX + "\\d+z", "gi"), "");
+          var strippedOfTokens = normalizedProtected.replace(new RegExp(TOKEN_PREFIX + "\\d+z", "gi"), "");
           var hasRealText = /[a-zA-ZÀ-ÿ]/.test(strippedOfTokens);
-          return { id: String(i), protectedText: pp.protectedText, map: pp.map, rec: rec, hasRealText: hasRealText, wasSmallCaps: wasSmallCaps };
+          return { id: String(i), protectedText: normalizedProtected, map: pp.map, rec: rec, hasRealText: hasRealText, wasSmallCaps: wasSmallCaps };
         });
 
         setProgress({ done: 0, total: items.length });
@@ -731,8 +751,11 @@
               var res = translated[it.id];
               if (res) {
                 counters[res.source] = (counters[res.source] || 0) + 1;
-                var restored = restorePlaceholders(res.text, it.map);
-                if (it.wasSmallCaps) restored = latinToSmallCaps(restored);
+                // Orden correcto: primero volver a small caps (el texto traducido todavía
+                // tiene tokens Zqkx7Zn0z en vez de códigos de color, así que la conversión
+                // no puede tocarlos), y solo DESPUÉS restaurar los placeholders/colores reales.
+                var withCase = it.wasSmallCaps ? latinToSmallCaps(res.text) : res.text;
+                var restored = restorePlaceholders(withCase, it.map);
                 resultMap[it.id] = restored;
                 // learn new auto-translations into the glossary for next time
                 if (res.source === "auto") {
@@ -1021,7 +1044,7 @@
           h("pre", { className: "out mono", style: { marginTop: 12 } }, outputContent)
         ),
 
-        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, etiquetas MiniMessage) no se traducen y se preservan exactamente igual. El texto en small caps (ᴀʙᴄ) se traduce y se devuelve en el mismo estilo. La traducción automática prueba varios servicios gratuitos en cascada; si todos fallan en tu red, aparecerá como \"sin traducir\".")
+        h("p", { className: "footnote" }, "Las claves, rutas, materiales, IDs de Minecraft y placeholders (%player%, {value}, &a, &#RRGGBB, #RRGGBB, etiquetas MiniMessage) no se traducen y se preservan exactamente igual. El texto en small caps (ᴀʙᴄ) se traduce y se devuelve en el mismo estilo. La traducción automática prueba varios servicios gratuitos en cascada; si todos fallan en tu red, aparecerá como \"sin traducir\".")
       )
     );
   }
