@@ -210,10 +210,62 @@
     /%%/g,
   ];
 
+  // Detecta si una línea (ya sin indentación ni "- ") comienza con un valor entre comillas.
+  // Devuelve la posición donde termina ese string (índice tras la comilla de cierre), o -1 si no aplica.
+  function quotedValueEnd(s) {
+    if (s[0] !== '"' && s[0] !== "'") return -1;
+    var q = s[0];
+    for (var i = 1; i < s.length; i++) {
+      if (s[i] === q) {
+        // YAML permite escapar comillas simples duplicándolas: 'it''s' -> it's
+        if (q === "'" && s[i + 1] === "'") { i++; continue; }
+        return i + 1;
+      }
+    }
+    return -1; // comilla sin cerrar: no lo tratamos como string cerrado
+  }
+
   function splitKeyValue(line) {
-    var m = line.match(/^(\s*)(-\s+)?([^:#][^:]*?)(:)(\s*)(.*)$/);
+    var m = line.match(/^(\s*)(-\s+)?(.*)$/s);
     if (!m) return null;
-    return { indent: m[1], dash: m[2] || "", key: m[3], colon: m[4], sp: m[5], rest: m[6] };
+    var indent = m[1], dash = m[2] || "", body = m[3];
+
+    // Si el contenido tras el guion (o la línea completa si no hay guion) empieza con una
+    // comilla, es un VALOR de string, no una "clave: valor" — aunque tenga ':' adentro.
+    // Ej: "- '&#54ADF4Name: &f%x%'" es un item de lista de texto, no un mapa {Name: ...}.
+    if (dash !== "" && quotedValueEnd(body) !== -1) {
+      return null; // dejar que splitListItem lo maneje como item de lista de texto
+    }
+
+    // Buscar el primer ':' que actúa como separador clave/valor, ignorando los que
+    // estén dentro de comillas (simples o dobles) más adelante en la línea.
+    var keyEnd = -1;
+    var inQuote = null;
+    for (var i = 0; i < body.length; i++) {
+      var c = body[i];
+      if (inQuote) {
+        if (c === inQuote) {
+          if (inQuote === "'" && body[i + 1] === "'") { i++; continue; }
+          inQuote = null;
+        }
+        continue;
+      }
+      if (c === '"' || c === "'") { inQuote = c; continue; }
+      if (c === "#" && (i === 0 || body[i - 1] === " ")) break; // comentario: no hay clave aquí
+      if (c === ":" && (body[i + 1] === undefined || body[i + 1] === " " || body[i + 1] === "\t")) {
+        keyEnd = i;
+        break;
+      }
+    }
+    if (keyEnd === -1) return null;
+
+    var key = body.slice(0, keyEnd);
+    if (key === "") return null;
+    var afterColon = body.slice(keyEnd + 1);
+    var spMatch = afterColon.match(/^(\s*)([\s\S]*)$/);
+    var sp = spMatch[1], rest = spMatch[2];
+
+    return { indent: indent, dash: dash, key: key, colon: ":", sp: sp, rest: rest };
   }
 
   // Línea de item de lista SIN clave, ej:  "  - '&7Una espada muy poderosa'"  o  "  - Sin descripción"
@@ -222,11 +274,9 @@
     var m = line.match(/^(\s*)-\s+(.*)$/);
     if (!m) return null;
     var rest = m[2];
-    // si el resto tiene forma "algo:" que parece ser un mapa dentro del item, no lo tratamos como texto plano
-    if (/^[^:#]+:\s*($|.)/.test(rest) && splitKeyValue(line) && splitKeyValue(line).key) {
-      // Es "- key: value" (splitKeyValue ya lo captura) -> dejar que lo maneje esa ruta
-      return null;
-    }
+    // Si splitKeyValue SÍ reconoce esta línea como "- key: value" real (sin comillas
+    // envolviendo todo el valor), entonces no es un item de texto plano.
+    if (splitKeyValue(line) !== null) return null;
     return { indent: m[1], rest: rest };
   }
 
